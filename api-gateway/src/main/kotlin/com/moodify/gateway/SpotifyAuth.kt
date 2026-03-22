@@ -2,23 +2,25 @@ package com.moodify.gateway
 
 import io.ktor.client.*
 import io.ktor.client.call.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.request.forms.*
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import java.util.Base64
-
-// ── Configuración OAuth2 ──────────────────────────────────────────────────────
 
 val SPOTIFY_CLIENT_ID     = System.getenv("SPOTIFY_CLIENT_ID")     ?: ""
 val SPOTIFY_CLIENT_SECRET = System.getenv("SPOTIFY_CLIENT_SECRET") ?: ""
 val SPOTIFY_REDIRECT_URI  = System.getenv("SPOTIFY_REDIRECT_URI")
-    ?: "http://localhost:8080/auth/callback"
+    ?: "http://127.0.0.1:8080/auth/callback"
 
 val SPOTIFY_SCOPES = listOf(
     "playlist-modify-public",
@@ -27,7 +29,12 @@ val SPOTIFY_SCOPES = listOf(
     "user-read-email",
 ).joinToString(" ")
 
-// ── Modelos ───────────────────────────────────────────────────────────────────
+// Cliente HTTP propio con ignoreUnknownKeys
+val spotifyClient = HttpClient(CIO) {
+    install(ContentNegotiation) {
+        json(Json { ignoreUnknownKeys = true })
+    }
+}
 
 @Serializable
 data class SpotifyTokenResponse(
@@ -53,19 +60,10 @@ data class SpotifyUserProfile(
 )
 
 @Serializable
-data class AuthResponse(
-    val loginUrl: String,
-)
-
-// ── Rutas OAuth2 ──────────────────────────────────────────────────────────────
+data class AuthResponse(val loginUrl: String)
 
 fun Route.spotifyAuthRoutes(client: HttpClient) {
 
-    /**
-     * GET /auth/login
-     * Flutter llama a este endpoint para obtener la URL de autorización de Spotify.
-     * Devuelve: { "loginUrl": "https://accounts.spotify.com/authorize?..." }
-     */
     get("/auth/login") {
         val loginUrl = URLBuilder("https://accounts.spotify.com/authorize").apply {
             parameters.append("client_id",     SPOTIFY_CLIENT_ID)
@@ -74,56 +72,60 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             parameters.append("scope",         SPOTIFY_SCOPES)
             parameters.append("show_dialog",   "false")
         }.buildString()
-
         call.respond(AuthResponse(loginUrl = loginUrl))
     }
 
-    /**
-     * GET /auth/callback?code=...
-     * Spotify redirige aquí después del login del usuario.
-     * Kotlin intercambia el code por un access_token y guarda la sesión.
-     */
     get("/auth/callback") {
         val code = call.request.queryParameters["code"]
-            ?: return@get call.respond(HttpStatusCode.BadRequest, "Falta el código de autorización")
+            ?: return@get call.respond(HttpStatusCode.BadRequest, "Falta el código")
 
-        // Intercambiamos el code por tokens
-        val tokenResponse: SpotifyTokenResponse = client.post("https://accounts.spotify.com/api/token") {
-            headers {
-                val credentials = Base64.getEncoder()
-                    .encodeToString("$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET".toByteArray())
-                append(HttpHeaders.Authorization, "Basic $credentials")
-            }
-            setBody(FormDataContent(Parameters.build {
-                append("grant_type",   "authorization_code")
-                append("code",         code)
-                append("redirect_uri", SPOTIFY_REDIRECT_URI)
-            }))
-        }.body()
+        // Intercambia code por token usando el cliente con ignoreUnknownKeys
+        val tokenResponse = runCatching {
+            spotifyClient.post("https://accounts.spotify.com/api/token") {
+                headers {
+                    val credentials = Base64.getEncoder()
+                        .encodeToString("$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET".toByteArray())
+                    append(HttpHeaders.Authorization, "Basic $credentials")
+                }
+                setBody(FormDataContent(Parameters.build {
+                    append("grant_type",   "authorization_code")
+                    append("code",         code)
+                    append("redirect_uri", SPOTIFY_REDIRECT_URI)
+                }))
+            }.body<SpotifyTokenResponse>()
+        }.getOrElse { e ->
+            return@get call.respond(
+                HttpStatusCode.BadRequest,
+                mapOf("error" to "Token error: ${e.message}")
+            )
+        }
 
-        // Obtenemos el perfil del usuario para guardar su ID
-        val userProfile: SpotifyUserProfile = client.get("https://api.spotify.com/v1/me") {
-            headers {
-                append(HttpHeaders.Authorization, "Bearer ${tokenResponse.accessToken}")
-            }
-        }.body()
+        // Obtiene el perfil del usuario
+        val userProfile = runCatching {
+            spotifyClient.get("https://api.spotify.com/v1/me") {
+                headers {
+                    append(HttpHeaders.Authorization, "Bearer ${tokenResponse.accessToken}")
+                }
+            }.body<SpotifyUserProfile>()
+        }.getOrElse { e ->
+            return@get call.respond(
+                HttpStatusCode.InternalServerError,
+                mapOf("error" to "Profile error: ${e.message}")
+            )
+        }
 
-        // Guardamos la sesión con el token
         call.sessions.set(UserSession(
-            accessToken  = tokenResponse.accessToken,
-            refreshToken = tokenResponse.refreshToken,
+            accessToken   = tokenResponse.accessToken,
+            refreshToken  = tokenResponse.refreshToken,
             spotifyUserId = userProfile.id,
         ))
 
-        // Redirigimos a Flutter con el token (deep link)
-        // En producción esto sería: moodify://callback?token=...
-        call.respondRedirect("http://localhost:${call.request.queryParameters["port"] ?: "60778"}/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}")
+        // Redirige a Flutter con el token
+        call.respondRedirect(
+            "http://localhost:57795/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}"
+        )
     }
 
-    /**
-     * POST /auth/logout
-     * Limpia la sesión del usuario.
-     */
     post("/auth/logout") {
         call.sessions.clear<UserSession>()
         call.respond(HttpStatusCode.OK, mapOf("message" to "Sesión cerrada"))

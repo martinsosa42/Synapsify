@@ -10,14 +10,18 @@ import io.ktor.server.sessions.*
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.http.*
 import org.slf4j.event.Level
-import java.io.File
+import kotlinx.serialization.json.Json
 
 fun main() {
     embeddedServer(Netty, port = 8080, module = Application::module).start(wait = true)
 }
 
 fun Application.module() {
-    install(ContentNegotiation) { json() }
+    install(ContentNegotiation) {
+        json(Json {
+            ignoreUnknownKeys = true
+        })
+    }
 
     install(CallLogging) { level = Level.INFO }
 
@@ -30,11 +34,10 @@ fun Application.module() {
         allowCredentials = true
     }
 
-    // Sessions para guardar el token de Spotify del usuario
     install(Sessions) {
-        cookie<UserSession>("moodify_session", directorySessionStorage(File(".sessions"))) {
+        cookie<UserSession>("moodify_session") {
             cookie.httpOnly = true
-            cookie.maxAgeInSeconds = 3600 // 1 hora
+            cookie.maxAgeInSeconds = 3600
         }
     }
 

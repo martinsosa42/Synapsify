@@ -88,25 +88,39 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             ?: return@get call.respond(HttpStatusCode.BadRequest, "Falta el código de autorización")
 
         // Intercambiamos el code por tokens
-        val tokenResponse: SpotifyTokenResponse = client.post("https://accounts.spotify.com/api/token") {
-            headers {
-                val credentials = Base64.getEncoder()
-                    .encodeToString("$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET".toByteArray())
-                append(HttpHeaders.Authorization, "Basic $credentials")
-            }
-            setBody(FormDataContent(Parameters.build {
-                append("grant_type",   "authorization_code")
-                append("code",         code)
-                append("redirect_uri", SPOTIFY_REDIRECT_URI)
-            }))
-        }.body()
+        val tokenResponse = runCatching {
+    client.post("https://accounts.spotify.com/api/token") {
+        headers {
+            val credentials = Base64.getEncoder()
+                .encodeToString("$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET".toByteArray())
+            append(HttpHeaders.Authorization, "Basic $credentials")
+        }
+        setBody(FormDataContent(Parameters.build {
+            append("grant_type",   "authorization_code")
+            append("code",         code)
+            append("redirect_uri", SPOTIFY_REDIRECT_URI)
+        }))
+    }.body<SpotifyTokenResponse>()
+}.getOrElse { e ->
+    return@get call.respond(
+        HttpStatusCode.BadRequest,
+        mapOf("error" to "Error al obtener el token: ${e.message}")
+    )
+}
 
-        // Obtenemos el perfil del usuario para guardar su ID
-        val userProfile: SpotifyUserProfile = client.get("https://api.spotify.com/v1/me") {
+    // Obtenemos el perfil del usuario para guardar su ID
+    val userProfile = runCatching {
+        client.get("https://api.spotify.com/v1/me") {
             headers {
                 append(HttpHeaders.Authorization, "Bearer ${tokenResponse.accessToken}")
             }
-        }.body()
+    }.body<SpotifyUserProfile>()
+}.getOrElse { e ->
+    return@get call.respond(
+        HttpStatusCode.InternalServerError,
+        mapOf("error" to "Error al obtener perfil: ${e.message}")
+    )
+}
 
         // Guardamos la sesión con el token
         call.sessions.set(UserSession(
@@ -117,7 +131,8 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
 
         // Redirigimos a Flutter con el token (deep link)
         // En producción esto sería: moodify://callback?token=...
-        call.respondRedirect("http://localhost:${call.request.queryParameters["port"] ?: "60778"}/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}")
+        call.respondRedirect("http://localhost:3000/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}"
+)
     }
 
     /**
