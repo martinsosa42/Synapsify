@@ -50,26 +50,6 @@ class MoodResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-EMOJI_MOOD_MAP = {
-    "😊": "happy cheerful pop",
-    "😢": "sad melancholic acoustic",
-    "😡": "angry intense rock",
-    "😴": "sleepy calm ambient",
-    "🔥": "energetic hype",
-    "❤️": "romantic love songs",
-    "🎉": "party dance",
-    "😰": "anxious tense",
-    "🌧️": "melancholic rainy day",
-    "☀️": "happy sunny upbeat",
-}
-
-def resolve_emoji_mood(text: str) -> str:
-    """Reemplaza emojis conocidos por su descripción musical."""
-    for emoji, description in EMOJI_MOOD_MAP.items():
-        text = text.replace(emoji, f" {description} ")
-    return text.strip()
-
-
 def compound_to_label(compound: float) -> str:
     if compound >= 0.05:
         return "positive"
@@ -151,11 +131,9 @@ async def analyze_mood(req: MoodRequest):
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="El texto no puede estar vacío.")
 
-    # Soporte de emojis
-    processed_text = resolve_emoji_mood(req.text)
 
     # Análisis de sentimiento
-    scores = analyzer.polarity_scores(processed_text)
+    scores = analyzer.polarity_scores(req.text)
     compound = scores["compound"]
     features = score_to_audio_features(compound)
     label = compound_to_label(compound)
