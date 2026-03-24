@@ -15,40 +15,26 @@ import io.ktor.server.sessions.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-// ── Schemas ───────────────────────────────────────────────────────────────────
-
 @Serializable
-data class MoodRequest(
-    val mood: String,
-    val limit: Int = 10,
-)
+data class MoodRequest(val mood: String, val limit: Int = 10)
 
 @Serializable
 data class LogicEngineRequest(
-    val text: String,
-    val limit: Int,
-    val accessToken: String? = null,   // token del usuario para guardar playlist
-    val userId: String? = null,
+    val text: String, val limit: Int,
+    val accessToken: String? = null, val userId: String? = null,
 )
 
 @Serializable
 data class TrackOut(
-    val id: String,
-    val name: String,
-    val artist: String,
-    val preview_url: String?,
-    val valence: Double,
-    val energy: Double,
-    val danceability: Double,
+    val id: String, val name: String, val artist: String,
+    val preview_url: String?, val valence: Double,
+    val energy: Double, val danceability: Double,
 )
 
 @Serializable
 data class LogicEngineResponse(
-    val sentiment: String,
-    val compound: Double,
-    val valence: Double,
-    val energy: Double,
-    val danceability: Double,
+    val interpretation: String,
+    val query_used: String,
     val tracks: List<TrackOut>,
     val playlistId: String? = null,
     val playlistUrl: String? = null,
@@ -56,8 +42,8 @@ data class LogicEngineResponse(
 
 @Serializable
 data class GatewayResponse(
-    val sentiment: String,
-    val compound: Double,
+    val interpretation: String,
+    val query_used: String,
     val tracks: List<TrackOut>,
     val playlistId: String? = null,
     val playlistUrl: String? = null,
@@ -66,19 +52,13 @@ data class GatewayResponse(
 @Serializable
 data class ErrorResponse(val error: String)
 
-// ── HTTP Client ───────────────────────────────────────────────────────────────
-
 val httpClient = HttpClient(CIO) {
     install(ContentNegotiation) {
-        json(Json {
-            ignoreUnknownKeys = true
-        })
+        json(Json { ignoreUnknownKeys = true })
     }
 }
 
 val logicEngineUrl = System.getenv("LOGIC_ENGINE_URL") ?: "http://localhost:8000"
-
-// ── Routing ───────────────────────────────────────────────────────────────────
 
 fun Application.configureRouting() {
     routing {
@@ -87,51 +67,29 @@ fun Application.configureRouting() {
             call.respond(mapOf("status" to "ok", "service" to "api-gateway"))
         }
 
-        // Rutas de autenticación OAuth2
         spotifyAuthRoutes(httpClient)
 
-        // POST /mood — genera playlist (con o sin autenticación)
         post("/mood") {
-            val request = runCatching { call.receive<MoodRequest>() }.getOrNull()
-                ?: return@post call.respond(
-                    HttpStatusCode.BadRequest,
-                    ErrorResponse("Cuerpo de petición inválido"),
-                )
-
-            if (request.mood.isBlank()) {
-                return@post call.respond(
-                    HttpStatusCode.UnprocessableEntity,
-                    ErrorResponse("El campo 'mood' no puede estar vacío"),
-                )
-            }
-
-            // Si el usuario está autenticado, pasamos su token al Logic Engine
-            val session = call.sessions.get<UserSession>()
-
             val engineResponse = runCatching {
-                httpClient.post("$logicEngineUrl/analyze") {
-                    contentType(ContentType.Application.Json)
-                    setBody(LogicEngineRequest(
-                        text        = request.mood,
-                        limit       = request.limit,
-                        accessToken = session?.accessToken,
-                        userId      = session?.spotifyUserId,
-                    ))
-                }.body<LogicEngineResponse>()
-            }.getOrElse { e ->
-                return@post call.respond(
-                    HttpStatusCode.BadGateway,
-                    ErrorResponse("Error al comunicarse con el Logic Engine: ${e.message}"),
-                )
-            }
-
-            call.respond(HttpStatusCode.OK, GatewayResponse(
-                sentiment   = engineResponse.sentiment,
-                compound    = engineResponse.compound,
-                tracks      = engineResponse.tracks,
-                playlistId  = engineResponse.playlistId,
-                playlistUrl = engineResponse.playlistUrl,
-            ))
-        }
+    val response = httpClient.post("$logicEngineUrl/analyze") {
+        contentType(ContentType.Application.Json)
+        setBody(LogicEngineRequest(
+            text = request.mood,
+            limit = request.limit,
+            accessToken = session?.accessToken,
+            userId = session?.spotifyUserId,
+        ))
     }
+    if (!response.status.isSuccess()) {
+        val errorBody = response.body<Map<String, String>>()
+        val msg = errorBody["detail"] ?: errorBody["error"] ?: "Error desconocido"
+        return@post call.respond(HttpStatusCode.BadGateway, ErrorResponse(msg))
+    }
+    response.body<LogicEngineResponse>()
+}.getOrElse { e ->
+    return@post call.respond(
+        HttpStatusCode.BadGateway,
+        ErrorResponse("Error al comunicarse con el Logic Engine: ${e.message}"),
+    )
+}
 }

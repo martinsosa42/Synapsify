@@ -1,30 +1,32 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
+from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy import Spotify
+import anthropic
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Moodify Me - Logic Engine", version="2.0.0")
+app = FastAPI(title="Moodify - Logic Engine", version="3.0.0")
 
-analyzer = SentimentIntensityAnalyzer()
+# ── Clientes ──────────────────────────────────────────────────────────────────
 
-# Client de solo lectura (sin usuario autenticado)
 sp_public = Spotify(auth_manager=SpotifyClientCredentials(
     client_id=os.getenv("SPOTIFY_CLIENT_ID"),
     client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
 ))
+
+claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class MoodRequest(BaseModel):
     text: str
     limit: int = 10
-    accessToken: str | None = None   # token OAuth2 del usuario (opcional)
+    accessToken: str | None = None
     userId: str | None = None
 
 
@@ -39,50 +41,89 @@ class TrackOut(BaseModel):
 
 
 class MoodResponse(BaseModel):
-    sentiment: str
-    compound: float
-    valence: float
-    energy: float
-    danceability: float
+    interpretation: str
+    query_used: str
     tracks: list[TrackOut]
     playlistId: str | None = None
     playlistUrl: str | None = None
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Prompt para Claude ────────────────────────────────────────────────────────
 
-def compound_to_label(compound: float) -> str:
-    if compound >= 0.05:
-        return "positive"
-    elif compound <= -0.05:
-        return "negative"
-    return "neutral"
+SYSTEM_PROMPT = """Sos un experto en música que convierte descripciones en lenguaje natural 
+en parámetros de búsqueda para la API de Spotify.
 
+El usuario describe lo que quiere escuchar. Tu trabajo es interpretar ese pedido y devolver 
+un JSON con los parámetros óptimos para buscar en Spotify.
 
-def score_to_audio_features(compound: float) -> dict:
-    valence = round((compound + 1) / 2, 2)
-    if compound >= 0.5:
-        energy, danceability = 0.8, 0.75
-    elif compound >= 0.05:
-        energy, danceability = 0.6, 0.6
-    elif compound >= -0.05:
-        energy, danceability = 0.5, 0.5
-    elif compound >= -0.5:
-        energy, danceability = 0.4, 0.4
-    else:
-        energy, danceability = 0.25, 0.3
-    return {"valence": valence, "energy": energy, "danceability": danceability}
+IMPORTANTE: Respondé ÚNICAMENTE con un JSON válido, sin texto adicional, sin markdown, 
+sin explicaciones. Solo el JSON puro.
 
-
-GENRE_QUERIES = {
-    "positive": "pop feliz dance hits",
-    "neutral":  "indie chill lo-fi focus",
-    "negative": "sad songs acoustic melancholic",
+El JSON debe tener exactamente esta estructura:
+{
+  "search_query": "string - query optimizada para Spotify search en inglés",
+  "search_type": "track",
+  "market": "AR",
+  "interpretation": "string - en español, qué entendiste del pedido en máximo 1 oración",
+  "target_energy": número entre 0.0 y 1.0 o null,
+  "target_valence": número entre 0.0 y 1.0 o null,
+  "target_danceability": número entre 0.0 y 1.0 o null,
+  "target_tempo": número en BPM o null
 }
 
+Guía de parámetros de audio:
+- energy: 0.0 = muy tranquilo/ambient, 1.0 = muy intenso/explosivo
+- valence: 0.0 = triste/oscuro, 1.0 = alegre/eufórico  
+- danceability: 0.0 = no bailable, 1.0 = muy bailable
+- tempo: en BPM (techno ~140, hip-hop ~90, jazz ~120, pop ~120)
 
-def search_tracks(sp: Spotify, query: str, limit: int) -> list[TrackOut]:
-    results = sp.search(q=query, type="track", limit=limit, market="AR")
+Ejemplos:
+- "Jazz suave para estudiar de noche" → query: "jazz study lofi night", energy: 0.3, valence: 0.4
+- "Canciones de Travis Scott" → query: "Travis Scott", energy: null, valence: null
+- "Progressive para un atardecer" → query: "progressive house sunset melodic", energy: 0.65, valence: 0.6
+- "Rock argentino de los 90" → query: "rock argentino 90s", energy: 0.7
+- "Techno para correr" → query: "techno running workout", energy: 0.9, tempo: 140
+"""
+
+
+def interpret_with_claude(text: str) -> dict:
+    """Usa Claude para convertir lenguaje natural en parámetros de Spotify."""
+    message = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        system=SYSTEM_PROMPT,
+        messages=[
+            {"role": "user", "content": f"Pedido del usuario: {text}"}
+        ]
+    )
+
+    raw = message.content[0].text.strip()
+
+    # Limpiar si Claude agrega backticks por accidente
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                raw = part
+                break
+
+    return json.loads(raw)
+
+
+# ── Helpers Spotify ───────────────────────────────────────────────────────────
+
+def search_tracks(sp: Spotify, params: dict, limit: int) -> list[TrackOut]:
+    query = params.get("search_query", "")
+    market = params.get("market", "AR")
+
+    results = sp.search(q=query, type="track", limit=limit, market=market)
     raw_tracks = results["tracks"]["items"]
+
+    if not raw_tracks:
+        return []
+
     track_ids = [t["id"] for t in raw_tracks]
 
     try:
@@ -92,33 +133,51 @@ def search_tracks(sp: Spotify, query: str, limit: int) -> list[TrackOut]:
 
     af_map = {af["id"]: af for af in audio_features if af}
 
-    return [
-        TrackOut(
-            id=t["id"],
-            name=t["name"],
-            artist=t["artists"][0]["name"],
-            preview_url=t.get("preview_url"),
-            valence=af_map.get(t["id"], {}).get("valence", 0.0),
-            energy=af_map.get(t["id"], {}).get("energy", 0.0),
-            danceability=af_map.get(t["id"], {}).get("danceability", 0.0),
-        )
-        for t in raw_tracks
-    ]
+    target_energy = params.get("target_energy")
+    target_valence = params.get("target_valence")
+    target_danceability = params.get("target_danceability")
+
+    scored_tracks = []
+    for track in raw_tracks:
+        af = af_map.get(track["id"], {})
+        valence = af.get("valence", 0.5)
+        energy = af.get("energy", 0.5)
+        danceability = af.get("danceability", 0.5)
+
+        # Calculamos score de match si hay parámetros de audio
+        targets = [
+            (target_energy, energy),
+            (target_valence, valence),
+            (target_danceability, danceability),
+        ]
+        active = [(t, v) for t, v in targets if t is not None]
+
+        if active:
+            match_score = sum(1 - abs(t - v) for t, v in active) / len(active)
+        else:
+            match_score = 1.0
+
+        scored_tracks.append((match_score, TrackOut(
+            id=track["id"],
+            name=track["name"],
+            artist=track["artists"][0]["name"],
+            preview_url=track.get("preview_url"),
+            valence=valence,
+            energy=energy,
+            danceability=danceability,
+        )))
+
+    scored_tracks.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scored_tracks]
 
 
-def save_playlist_to_spotify(
-    sp: Spotify,
-    user_id: str,
-    mood_text: str,
-    track_ids: list[str],
-    sentiment: str,
-) -> tuple[str, str]:
-    """Crea una playlist en la cuenta del usuario y agrega las canciones."""
+def save_playlist(sp: Spotify, user_id: str, text: str,
+                  track_ids: list[str], interpretation: str) -> tuple[str, str]:
     playlist = sp.user_playlist_create(
         user=user_id,
-        name=f"Moodify: {mood_text[:40]}",
+        name=f"Moodify: {text[:40]}",
         public=False,
-        description=f"Generada por Moodify Me · Sentimiento: {sentiment}",
+        description=f"Generada por Moodify · {interpretation}",
     )
     sp.playlist_add_items(playlist["id"], [f"spotify:track:{tid}" for tid in track_ids])
     return playlist["id"], playlist["external_urls"]["spotify"]
@@ -131,61 +190,57 @@ async def analyze_mood(req: MoodRequest):
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="El texto no puede estar vacío.")
 
-
-    # Análisis de sentimiento
-    scores = analyzer.polarity_scores(req.text)
-    compound = scores["compound"]
-    features = score_to_audio_features(compound)
-    label = compound_to_label(compound)
-
-    # Elegimos el cliente correcto según si hay token de usuario
-    if req.accessToken:
-        sp = Spotify(auth=req.accessToken)
-    else:
-        sp = sp_public
-
-    # Búsqueda de canciones
-    query = GENRE_QUERIES[label]
+    # 1. Claude interpreta el pedido
     try:
-        tracks = search_tracks(sp, query, req.limit)
+        params = interpret_with_claude(req.text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error al interpretar con Claude: {str(e)}")
+
+    interpretation = params.get("interpretation", req.text)
+    query_used = params.get("search_query", req.text)
+
+    # 2. Elegimos el cliente de Spotify
+    sp = Spotify(auth=req.accessToken) if req.accessToken else sp_public
+
+    # 3. Buscamos canciones
+    try:
+        tracks = search_tracks(sp, params, req.limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error Spotify: {str(e)}")
 
-    # Guardar playlist si el usuario está autenticado
+    if not tracks:
+        raise HTTPException(status_code=404,
+                            detail="No se encontraron canciones para ese pedido.")
+
+    # 4. Guardamos playlist si hay sesión activa
     playlist_id, playlist_url = None, None
-    if req.accessToken and req.userId and tracks:
+    if req.accessToken and req.userId:
         try:
-            playlist_id, playlist_url = save_playlist_to_spotify(
+            playlist_id, playlist_url = save_playlist(
                 sp=sp,
                 user_id=req.userId,
-                mood_text=req.text,
+                text=req.text,
                 track_ids=[t.id for t in tracks],
-                sentiment=label,
+                interpretation=interpretation,
             )
         except Exception as e:
-            # No es crítico — devolvemos las canciones igual
             print(f"No se pudo guardar la playlist: {e}")
 
     return MoodResponse(
-        sentiment=label,
-        compound=compound,
+        interpretation=interpretation,
+        query_used=query_used,
         tracks=tracks,
         playlistId=playlist_id,
         playlistUrl=playlist_url,
-        **features,
     )
 
 
 @app.post("/feedback")
 async def save_feedback(track_id: str, liked: bool, mood: str):
-    """
-    Endpoint para el bucle de feedback (Fase 4).
-    Por ahora loguea el dato — en Fase 4 se conecta a una DB.
-    """
     print(f"FEEDBACK | track={track_id} | liked={liked} | mood={mood}")
     return {"status": "ok"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "logic-engine"}
+    return {"status": "ok", "service": "logic-engine", "version": "3.0.0"}
