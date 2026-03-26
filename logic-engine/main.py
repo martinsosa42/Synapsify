@@ -3,14 +3,14 @@ from pydantic import BaseModel
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy import Spotify
-import anthropic
+from groq import Groq
 import os
 import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Moodify - Logic Engine", version="3.0.0")
+app = FastAPI(title="Moodify - Logic Engine", version="3.2.0")
 
 # ── Clientes ──────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ sp_public = Spotify(auth_manager=SpotifyClientCredentials(
     client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
 ))
 
-claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ class MoodResponse(BaseModel):
     playlistId: str | None = None
     playlistUrl: str | None = None
 
-# ── Prompt para Claude ────────────────────────────────────────────────────────
+# ── Prompt ────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Sos un experto en música que convierte descripciones en lenguaje natural 
 en parámetros de búsqueda para la API de Spotify.
@@ -85,20 +85,21 @@ Ejemplos:
 """
 
 
-def interpret_with_claude(text: str) -> dict:
-    """Usa Claude para convertir lenguaje natural en parámetros de Spotify."""
-    message = claude.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        system=SYSTEM_PROMPT,
+def interpret_with_groq(text: str) -> dict:
+    """Usa Groq para convertir lenguaje natural en parámetros de Spotify."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Pedido del usuario: {text}"}
-        ]
+        ],
+        max_tokens=500,
+        temperature=0.3,
     )
 
-    raw = message.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
 
-    # Limpiar si Claude agrega backticks por accidente
+    # Limpiar si el modelo agrega backticks por accidente
     if "```" in raw:
         parts = raw.split("```")
         for part in parts:
@@ -144,7 +145,6 @@ def search_tracks(sp: Spotify, params: dict, limit: int) -> list[TrackOut]:
         energy = af.get("energy", 0.5)
         danceability = af.get("danceability", 0.5)
 
-        # Calculamos score de match si hay parámetros de audio
         targets = [
             (target_energy, energy),
             (target_valence, valence),
@@ -190,11 +190,11 @@ async def analyze_mood(req: MoodRequest):
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="El texto no puede estar vacío.")
 
-    # 1. Claude interpreta el pedido
+    # 1. Groq interpreta el pedido
     try:
-        params = interpret_with_claude(req.text)
+        params = interpret_with_groq(req.text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error al interpretar con Claude: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error al interpretar con Groq: {str(e)}")
 
     interpretation = params.get("interpretation", req.text)
     query_used = params.get("search_query", req.text)
@@ -243,4 +243,4 @@ async def save_feedback(track_id: str, liked: bool, mood: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "logic-engine", "version": "3.0.0"}
+    return {"status": "ok", "service": "logic-engine", "version": "3.2.0"}
