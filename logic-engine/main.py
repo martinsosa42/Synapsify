@@ -5,6 +5,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from spotipy import Spotify, SpotifyClientCredentials
+from spotipy.cache_handler import MemoryCacheHandler
 from groq import Groq
 import os
 import json
@@ -37,16 +38,16 @@ app.add_middleware(
 sp_public = Spotify(auth_manager=SpotifyClientCredentials(
     client_id=os.getenv("SPOTIFY_CLIENT_ID"),
     client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+    cache_handler=MemoryCacheHandler(),
 ))
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
-# [FIX] limit acotado entre 1 y 50 — evita abusos y errores con audio_features()
 class MoodRequest(BaseModel):
     text: str
-    limit: int = Field(default=10, ge=1, le=50)
+    limit: int = Field(default=50, ge=1, le=50)  # [CHANGE] default 10 → 50
     accessToken: str | None = None
     userId: str | None = None
 
@@ -67,6 +68,23 @@ class MoodResponse(BaseModel):
     tracks: list[TrackOut]
     playlistId: str | None = None
     playlistUrl: str | None = None
+
+
+# [NEW] Schemas para /export
+class ExportRequest(BaseModel):
+    accessToken: str
+    trackIds: list[str] = Field(min_length=1, max_length=50)
+    mode: str = Field(pattern="^(create|add)$")          # "create" o "add"
+    playlistName: str | None = Field(default=None, max_length=100)
+    targetPlaylistId: str | None = None
+    moodText: str | None = Field(default=None, max_length=100)
+
+
+class ExportResponse(BaseModel):
+    playlistId: str
+    playlistUrl: str
+    tracksAdded: int
+
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -105,7 +123,6 @@ Ejemplos:
 - "Techno para correr" → query: "techno running workout", energy: 0.9, tempo: 140
 """
 
-# [FIX] Whitelist de mercados válidos — evita prompt injection en el campo market
 VALID_MARKETS = {
     "AR", "US", "ES", "MX", "BR", "CO", "CL", "PE", "UY", "PY",
     "GB", "DE", "FR", "IT", "JP", "AU", "CA", "NZ", "ZA",
@@ -113,7 +130,6 @@ VALID_MARKETS = {
 
 
 def _clamp_float(value, lo: float = 0.0, hi: float = 1.0):
-    """Retorna el valor si está en rango válido, None si no."""
     try:
         v = float(value)
         return v if lo <= v <= hi else None
@@ -121,7 +137,6 @@ def _clamp_float(value, lo: float = 0.0, hi: float = 1.0):
         return None
 
 
-# [FIX] Validación del JSON de Groq para mitigar prompt injection
 def validate_groq_params(params: dict) -> dict:
     query = str(params.get("search_query", "")).strip()[:200]
     if not query:
@@ -151,7 +166,6 @@ def validate_groq_params(params: dict) -> dict:
 
 
 def interpret_with_groq(text: str) -> dict:
-    """Usa Groq para convertir lenguaje natural en parámetros de Spotify."""
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -164,7 +178,6 @@ def interpret_with_groq(text: str) -> dict:
 
     raw = response.choices[0].message.content.strip()
 
-    # Limpiar si el modelo agrega backticks por accidente
     if "```" in raw:
         parts = raw.split("```")
         for part in parts:
@@ -175,7 +188,6 @@ def interpret_with_groq(text: str) -> dict:
                 raw = part
                 break
 
-    # [FIX] JSON parse con error controlado — no expone stack interno al cliente
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -187,12 +199,30 @@ def interpret_with_groq(text: str) -> dict:
 
 # ── Helpers Spotify ───────────────────────────────────────────────────────────
 
+_SEARCH_PAGE_SIZE = 10  # spotipy acepta máx 20 por llamada con Client Credentials
+
 def search_tracks(sp: Spotify, params: dict, limit: int) -> list[TrackOut]:
     query = params.get("search_query", "")
     market = params.get("market", "AR")
 
-    results = sp.search(q=query, type="track", limit=limit, market=market)
-    raw_tracks = results["tracks"]["items"]
+    # Spotify Search acepta máx 20 por página — hacemos las páginas necesarias
+    raw_tracks: list = []
+    pages = (limit + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE  # ceil division
+    for page in range(pages):
+        need = min(_SEARCH_PAGE_SIZE, limit - len(raw_tracks))
+        try:
+            results = sp.search(
+                q=query, type="track",
+                limit=need, offset=page * _SEARCH_PAGE_SIZE,
+                market=market,
+            )
+            items = results["tracks"]["items"]
+            raw_tracks.extend(items)
+            if len(items) < need:
+                break  # Spotify no tiene más resultados
+        except Exception:
+            logger.warning("Página %d de búsqueda falló, usando lo que hay", page)
+            break
 
     if not raw_tracks:
         return []
@@ -249,7 +279,6 @@ def search_tracks(sp: Spotify, params: dict, limit: int) -> list[TrackOut]:
 
 def save_playlist(sp: Spotify, text: str,
                   track_ids: list[str], interpretation: str) -> tuple[str, str]:
-    # [FIX] userId obtenido desde el token — no se acepta del cliente
     user_id = sp.me()["id"]
     playlist = sp.user_playlist_create(
         user=user_id,
@@ -264,12 +293,11 @@ def save_playlist(sp: Spotify, text: str,
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyze", response_model=MoodResponse)
-@limiter.limit("10/minute")  # [FIX] Rate limiting por IP
+@limiter.limit("10/minute")
 async def analyze_mood(req: MoodRequest, request: Request):
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="El texto no puede estar vacío.")
 
-    # 1. Groq interpreta el pedido
     try:
         params = interpret_with_groq(req.text)
     except ValueError as e:
@@ -281,12 +309,11 @@ async def analyze_mood(req: MoodRequest, request: Request):
     interpretation = params.get("interpretation", req.text)
     query_used = params.get("search_query", req.text)
 
-    # 2. Elegimos el cliente de Spotify
-    sp = Spotify(auth=req.accessToken) if req.accessToken else sp_public
+    # Búsqueda siempre con Client Credentials (sin límites de token de usuario)
+    sp_user = Spotify(auth=req.accessToken) if req.accessToken else None
 
-    # 3. Buscamos canciones
     try:
-        tracks = search_tracks(sp, params, req.limit)
+        tracks = search_tracks(sp_public, params, req.limit)
     except Exception:
         logger.exception("Error al buscar en Spotify")
         raise HTTPException(status_code=502, detail="Error al buscar canciones en Spotify.")
@@ -295,13 +322,11 @@ async def analyze_mood(req: MoodRequest, request: Request):
         raise HTTPException(status_code=404,
                             detail="No se encontraron canciones para ese pedido.")
 
-    # 4. Guardamos playlist si hay sesión activa
-    # [FIX] userId ya no viene del cliente — se obtiene del token en save_playlist()
     playlist_id, playlist_url = None, None
-    if req.accessToken:
+    if sp_user:
         try:
             playlist_id, playlist_url = save_playlist(
-                sp=sp,
+                sp=sp_user,
                 text=req.text,
                 track_ids=[t.id for t in tracks],
                 interpretation=interpretation,
@@ -316,6 +341,70 @@ async def analyze_mood(req: MoodRequest, request: Request):
         playlistId=playlist_id,
         playlistUrl=playlist_url,
     )
+
+
+# [NEW] Endpoint de export explícito
+@app.post("/export", response_model=ExportResponse)
+@limiter.limit("10/minute")
+async def export_playlist(req: ExportRequest, request: Request):
+    sp = Spotify(auth=req.accessToken)
+    uris = [f"spotify:track:{tid}" for tid in req.trackIds]
+
+    try:
+        if req.mode == "create":
+            # Crear playlist nueva
+            name = req.playlistName or f"Synapsify · {req.moodText or 'Mix'}"[:100]
+            user_id = sp.me()["id"]
+            playlist = sp.user_playlist_create(
+                user=user_id,
+                name=name,
+                public=False,
+                description="Exportada desde Synapsify",
+            )
+            sp.playlist_add_items(playlist["id"], uris)
+            return ExportResponse(
+                playlistId=playlist["id"],
+                playlistUrl=playlist["external_urls"]["spotify"],
+                tracksAdded=len(uris),
+            )
+
+        else:  # mode == "add"
+            if not req.targetPlaylistId:
+                raise HTTPException(status_code=422,
+                                    detail="targetPlaylistId requerido para mode=add")
+            sp.playlist_add_items(req.targetPlaylistId, uris)
+            playlist = sp.playlist(req.targetPlaylistId,
+                                   fields="id,external_urls")
+            return ExportResponse(
+                playlistId=playlist["id"],
+                playlistUrl=playlist["external_urls"]["spotify"],
+                tracksAdded=len(uris),
+            )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Error al exportar playlist")
+        raise HTTPException(status_code=502, detail="Error al exportar la playlist.")
+
+
+# [NEW] Endpoint para listar playlists del usuario (usado en mode=add)
+@app.get("/playlists")
+async def list_playlists(access_token: str):
+    if not access_token:
+        raise HTTPException(status_code=401, detail="access_token requerido.")
+    try:
+        sp = Spotify(auth=access_token)
+        results = sp.current_user_playlists(limit=50)
+        playlists = [
+            {"id": p["id"], "name": p["name"], "total": p["tracks"]["total"]}
+            for p in results["items"]
+            if p and p.get("id")
+        ]
+        return {"playlists": playlists}
+    except Exception:
+        logger.exception("Error al obtener playlists")
+        raise HTTPException(status_code=502, detail="Error al obtener las playlists.")
 
 
 @app.get("/health")

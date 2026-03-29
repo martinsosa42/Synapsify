@@ -20,7 +20,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class MoodRequest(
     val mood: String,
-    val limit: Int = 10,
+    val limit: Int = 50,  // [CHANGE] default 10 → 50
 )
 
 @Serializable
@@ -53,6 +53,46 @@ data class LogicEngineResponse(
 
 @Serializable
 data class ErrorResponse(val error: String)
+
+// [NEW] Schemas para /export
+@Serializable
+data class ExportRequest(
+    val trackIds: List<String>,
+    val mode: String,                   // "create" | "add"
+    val playlistName: String? = null,
+    val targetPlaylistId: String? = null,
+    val moodText: String? = null,
+)
+
+@Serializable
+data class LogicEngineExportRequest(
+    val accessToken: String,
+    val trackIds: List<String>,
+    val mode: String,
+    val playlistName: String? = null,
+    val targetPlaylistId: String? = null,
+    val moodText: String? = null,
+)
+
+@Serializable
+data class ExportResponse(
+    val playlistId: String,
+    val playlistUrl: String,
+    val tracksAdded: Int,
+)
+
+// [NEW] Schema para /playlists
+@Serializable
+data class PlaylistItem(
+    val id: String,
+    val name: String,
+    val total: Int,
+)
+
+@Serializable
+data class PlaylistsResponse(
+    val playlists: List<PlaylistItem>,
+)
 
 // ── HTTP Client ───────────────────────────────────────────────────────────────
 
@@ -114,6 +154,88 @@ fun Application.configureRouting() {
             }
 
             call.respond(HttpStatusCode.OK, engineResponse)
+        }
+
+        // [NEW] POST /export — exporta tracks a una playlist de Spotify
+        post("/export") {
+            val session = call.sessions.get<UserSession>()
+                ?: return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    ErrorResponse("Debés iniciar sesión con Spotify para exportar."),
+                )
+
+            val request = runCatching { call.receive<ExportRequest>() }.getOrNull()
+                ?: return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    ErrorResponse("Cuerpo de petición inválido"),
+                )
+
+            if (request.trackIds.isEmpty()) {
+                return@post call.respond(
+                    HttpStatusCode.UnprocessableEntity,
+                    ErrorResponse("La lista de tracks no puede estar vacía"),
+                )
+            }
+
+            if (request.mode !in listOf("create", "add")) {
+                return@post call.respond(
+                    HttpStatusCode.UnprocessableEntity,
+                    ErrorResponse("mode debe ser 'create' o 'add'"),
+                )
+            }
+
+            val exportResponse = runCatching {
+                val response = httpClient.post("$logicEngineUrl/export") {
+                    contentType(ContentType.Application.Json)
+                    setBody(LogicEngineExportRequest(
+                        accessToken      = session.accessToken,
+                        trackIds         = request.trackIds,
+                        mode             = request.mode,
+                        playlistName     = request.playlistName,
+                        targetPlaylistId = request.targetPlaylistId,
+                        moodText         = request.moodText,
+                    ))
+                }
+                if (!response.status.isSuccess()) {
+                    val errorBody = response.bodyAsText()
+                    throw Exception("Logic Engine respondió ${response.status.value}: $errorBody")
+                }
+                response.body<ExportResponse>()
+            }.getOrElse { e ->
+                return@post call.respond(
+                    HttpStatusCode.BadGateway,
+                    ErrorResponse("Error al exportar: ${e.message}"),
+                )
+            }
+
+            call.respond(HttpStatusCode.OK, exportResponse)
+        }
+
+        // [NEW] GET /playlists — lista las playlists del usuario autenticado
+        get("/playlists") {
+            val session = call.sessions.get<UserSession>()
+                ?: return@get call.respond(
+                    HttpStatusCode.Unauthorized,
+                    ErrorResponse("Debés iniciar sesión con Spotify."),
+                )
+
+            val playlistsResponse = runCatching {
+                val response = httpClient.get("$logicEngineUrl/playlists") {
+                    parameter("access_token", session.accessToken)
+                }
+                if (!response.status.isSuccess()) {
+                    val errorBody = response.bodyAsText()
+                    throw Exception("Logic Engine respondió ${response.status.value}: $errorBody")
+                }
+                response.body<PlaylistsResponse>()
+            }.getOrElse { e ->
+                return@get call.respond(
+                    HttpStatusCode.BadGateway,
+                    ErrorResponse("Error al obtener playlists: ${e.message}"),
+                )
+            }
+
+            call.respond(HttpStatusCode.OK, playlistsResponse)
         }
     }
 }

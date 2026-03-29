@@ -60,13 +60,26 @@ class UserSession {
   UserSession({required this.accessToken, required this.userId});
 }
 
+// [NEW] Modelo para items de playlist del usuario
+class SpotifyPlaylist {
+  final String id;
+  final String name;
+  final int total;
+  SpotifyPlaylist({required this.id, required this.name, required this.total});
+  factory SpotifyPlaylist.fromJson(Map<String, dynamic> json) => SpotifyPlaylist(
+        id:    json['id']    as String,
+        name:  json['name']  as String,
+        total: json['total'] as int,
+      );
+}
+
 // ── API ───────────────────────────────────────────────────────────────────────
 
 Future<PlaylistResult> fetchPlaylist(String prompt) async {
   final response = await http.post(
     Uri.parse('$_gatewayUrl/mood'),
     headers: {'Content-Type': 'application/json'},
-    body: jsonEncode({'mood': prompt, 'limit': 10}),
+    body: jsonEncode({'mood': prompt, 'limit': 50}),  // [CHANGE] 10 → 50
   );
   if (response.statusCode != 200) {
     final body = jsonDecode(response.body);
@@ -78,6 +91,45 @@ Future<PlaylistResult> fetchPlaylist(String prompt) async {
 Future<String> getLoginUrl() async {
   final response = await http.get(Uri.parse('$_gatewayUrl/auth/login'));
   return jsonDecode(response.body)['loginUrl'];
+}
+
+// [NEW] Obtener playlists del usuario
+Future<List<SpotifyPlaylist>> fetchUserPlaylists() async {
+  final response = await http.get(Uri.parse('$_gatewayUrl/playlists'));
+  if (response.statusCode != 200) {
+    final body = jsonDecode(response.body);
+    throw Exception(body['error'] ?? 'Error al obtener playlists');
+  }
+  final data = jsonDecode(response.body);
+  return (data['playlists'] as List)
+      .map((p) => SpotifyPlaylist.fromJson(p as Map<String, dynamic>))
+      .toList();
+}
+
+// [NEW] Exportar tracks a Spotify
+Future<Map<String, dynamic>> exportToSpotify({
+  required List<String> trackIds,
+  required String mode,
+  String? playlistName,
+  String? targetPlaylistId,
+  String? moodText,
+}) async {
+  final response = await http.post(
+    Uri.parse('$_gatewayUrl/export'),
+    headers: {'Content-Type': 'application/json'},
+    body: jsonEncode({
+      'trackIds': trackIds,
+      'mode': mode,
+      if (playlistName != null) 'playlistName': playlistName,
+      if (targetPlaylistId != null) 'targetPlaylistId': targetPlaylistId,
+      if (moodText != null) 'moodText': moodText,
+    }),
+  );
+  if (response.statusCode != 200) {
+    final body = jsonDecode(response.body);
+    throw Exception(body['error'] ?? 'Error al exportar');
+  }
+  return jsonDecode(response.body) as Map<String, dynamic>;
 }
 
 const _examples = [
@@ -108,7 +160,6 @@ class SynapsifyApp extends StatelessWidget {
       ),
       home: const SynapsifyScreen(),
       onGenerateRoute: (settings) {
-        // Maneja el redirect de Spotify: /callback?token=...&userId=...
         if (settings.name != null && settings.name!.startsWith('/callback')) {
           final uri = Uri.parse(settings.name!);
           final token  = uri.queryParameters['token'];
@@ -201,6 +252,20 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
   void _logout() {
     setState(() => _session = null);
     http.post(Uri.parse('$_gatewayUrl/auth/logout'));
+  }
+
+  // [NEW] Abre el bottom sheet de exportación
+  void _showExportSheet() {
+    if (_result == null) return;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _ExportSheet(
+        tracks: _result!.tracks,
+        moodText: _controller.text.trim(),
+      ),
+    );
   }
 
   @override
@@ -417,7 +482,7 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
 
                         const SizedBox(height: 16),
 
-                        // Botón
+                        // Botón generar
                         _GenerateButton(loading: _loading, onPressed: _generate),
 
                         const SizedBox(height: 20),
@@ -452,6 +517,34 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
                                 ),
                               ),
                               const Spacer(),
+
+                              // [NEW] Botón exportar (solo si hay sesión activa)
+                              if (_session != null)
+                                GestureDetector(
+                                  onTap: _showExportSheet,
+                                  child: Container(
+                                    margin: const EdgeInsets.only(right: 8),
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.transparent,
+                                      borderRadius: BorderRadius.circular(20),
+                                      border: Border.all(color: _green.withOpacity(0.5)),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.ios_share, size: 14, color: _green),
+                                        SizedBox(width: 4),
+                                        Text('Exportar',
+                                            style: TextStyle(
+                                                fontSize: 12,
+                                                color: _green,
+                                                fontWeight: FontWeight.w600)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+
                               if (_result!.playlistUrl != null)
                                 GestureDetector(
                                   onTap: () => launchUrl(
@@ -553,7 +646,402 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
   }
 }
 
+// ── [NEW] Export Bottom Sheet ─────────────────────────────────────────────────
+
+class _ExportSheet extends StatefulWidget {
+  final List<Track> tracks;
+  final String moodText;
+  const _ExportSheet({required this.tracks, required this.moodText});
+
+  @override
+  State<_ExportSheet> createState() => _ExportSheetState();
+}
+
+class _ExportSheetState extends State<_ExportSheet>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  // Pestaña "Crear nueva"
+  final _nameController = TextEditingController();
+  bool _creatingPlaylist = false;
+  String? _createError;
+
+  // Pestaña "Agregar a existente"
+  List<SpotifyPlaylist>? _userPlaylists;
+  bool _loadingPlaylists = true;
+  String? _loadError;
+  String? _selectedPlaylistId;
+  bool _addingTracks = false;
+  String? _addError;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _nameController.text = widget.moodText.isNotEmpty
+        ? 'Synapsify · ${widget.moodText}'.substring(
+            0, 'Synapsify · ${widget.moodText}'.length.clamp(0, 60))
+        : 'Synapsify Mix';
+    _loadPlaylists();
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadPlaylists() async {
+    try {
+      final playlists = await fetchUserPlaylists();
+      setState(() { _userPlaylists = playlists; _loadingPlaylists = false; });
+    } catch (e) {
+      setState(() { _loadError = e.toString(); _loadingPlaylists = false; });
+    }
+  }
+
+  Future<void> _createNew() async {
+    final name = _nameController.text.trim();
+    if (name.isEmpty) return;
+    setState(() { _creatingPlaylist = true; _createError = null; });
+    try {
+      final result = await exportToSpotify(
+        trackIds: widget.tracks.map((t) => t.id).toList(),
+        mode: 'create',
+        playlistName: name,
+        moodText: widget.moodText,
+      );
+      if (!mounted) return;
+      Navigator.pop(context);
+      _showSuccessSnack(result['playlistUrl'] as String, result['tracksAdded'] as int);
+    } catch (e) {
+      setState(() { _createError = e.toString(); _creatingPlaylist = false; });
+    }
+  }
+
+  Future<void> _addToExisting() async {
+    if (_selectedPlaylistId == null) return;
+    setState(() { _addingTracks = true; _addError = null; });
+    try {
+      final result = await exportToSpotify(
+        trackIds: widget.tracks.map((t) => t.id).toList(),
+        mode: 'add',
+        targetPlaylistId: _selectedPlaylistId,
+      );
+      if (!mounted) return;
+      Navigator.pop(context);
+      _showSuccessSnack(result['playlistUrl'] as String, result['tracksAdded'] as int);
+    } catch (e) {
+      setState(() { _addError = e.toString(); _addingTracks = false; });
+    }
+  }
+
+  void _showSuccessSnack(String url, int count) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: _surface,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle, color: _green, size: 18),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text('$count canciones exportadas a Spotify',
+                  style: const TextStyle(color: Colors.white, fontSize: 13)),
+            ),
+            GestureDetector(
+              onTap: () => launchUrl(Uri.parse(url),
+                  mode: LaunchMode.externalApplication),
+              child: const Text('Abrir',
+                  style: TextStyle(color: _green, fontWeight: FontWeight.w700, fontSize: 13)),
+            ),
+          ],
+        ),
+        duration: const Duration(seconds: 5),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF0A1510),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        border: Border(top: BorderSide(color: Color(0xFF1A3020), width: 1)),
+      ),
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Handle
+          Container(
+            margin: const EdgeInsets.only(top: 12, bottom: 4),
+            width: 36, height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+
+          // Header
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+            child: Row(
+              children: [
+                const Icon(Icons.ios_share, color: _green, size: 18),
+                const SizedBox(width: 10),
+                const Text('Exportar a Spotify',
+                    style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white)),
+                const Spacer(),
+                Text('${widget.tracks.length} canciones',
+                    style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.4))),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // Tabs
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Container(
+              decoration: BoxDecoration(
+                color: _surface,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: TabBar(
+                controller: _tabController,
+                indicator: BoxDecoration(
+                  color: _green.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: _green.withOpacity(0.4)),
+                ),
+                indicatorSize: TabBarIndicatorSize.tab,
+                dividerColor: Colors.transparent,
+                labelColor: _green,
+                unselectedLabelColor: Colors.white.withOpacity(0.4),
+                labelStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                tabs: const [
+                  Tab(text: 'Crear nueva'),
+                  Tab(text: 'Agregar a existente'),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // Contenido de los tabs
+          SizedBox(
+            height: 260,
+            child: TabBarView(
+              controller: _tabController,
+              children: [
+                // ── Tab 1: Crear nueva ──────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text('Nombre de la playlist',
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withOpacity(0.45))),
+                      const SizedBox(height: 8),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: _surfaceHigh,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: const Color(0xFF1A3020)),
+                        ),
+                        child: TextField(
+                          controller: _nameController,
+                          style: const TextStyle(color: Colors.white, fontSize: 14),
+                          maxLength: 100,
+                          decoration: const InputDecoration(
+                            border: InputBorder.none,
+                            contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                            counterText: '',
+                          ),
+                        ),
+                      ),
+                      if (_createError != null) ...[
+                        const SizedBox(height: 8),
+                        Text(_createError!,
+                            style: const TextStyle(color: Color(0xFFFF6B6B), fontSize: 12)),
+                      ],
+                      const Spacer(),
+                      _ExportButton(
+                        label: 'Crear en Spotify',
+                        loading: _creatingPlaylist,
+                        onPressed: _createNew,
+                      ),
+                    ],
+                  ),
+                ),
+
+                // ── Tab 2: Agregar a existente ───────────────────────────
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (_loadingPlaylists)
+                        const Expanded(
+                          child: Center(
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation(_green)),
+                          ),
+                        )
+                      else if (_loadError != null)
+                        Expanded(
+                          child: Center(
+                            child: Text(_loadError!,
+                                style: const TextStyle(
+                                    color: Color(0xFFFF6B6B), fontSize: 13)),
+                          ),
+                        )
+                      else ...[
+                        Expanded(
+                          child: ListView.builder(
+                            itemCount: _userPlaylists!.length,
+                            itemBuilder: (context, i) {
+                              final pl = _userPlaylists![i];
+                              final selected = _selectedPlaylistId == pl.id;
+                              return GestureDetector(
+                                onTap: () => setState(
+                                    () => _selectedPlaylistId = pl.id),
+                                child: Container(
+                                  margin: const EdgeInsets.only(bottom: 6),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 14, vertical: 10),
+                                  decoration: BoxDecoration(
+                                    color: selected
+                                        ? _green.withOpacity(0.12)
+                                        : _surfaceHigh,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: selected
+                                          ? _green.withOpacity(0.5)
+                                          : const Color(0xFF1A3020),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        selected
+                                            ? Icons.check_circle
+                                            : Icons.queue_music,
+                                        size: 16,
+                                        color: selected
+                                            ? _green
+                                            : Colors.white.withOpacity(0.3),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(pl.name,
+                                            style: TextStyle(
+                                                fontSize: 13,
+                                                color: selected
+                                                    ? Colors.white
+                                                    : Colors.white
+                                                        .withOpacity(0.7)),
+                                            overflow: TextOverflow.ellipsis),
+                                      ),
+                                      Text('${pl.total}',
+                                          style: TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.white
+                                                  .withOpacity(0.25))),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        if (_addError != null) ...[
+                          const SizedBox(height: 6),
+                          Text(_addError!,
+                              style: const TextStyle(
+                                  color: Color(0xFFFF6B6B), fontSize: 12)),
+                        ],
+                        const SizedBox(height: 10),
+                        _ExportButton(
+                          label: 'Agregar a playlist',
+                          loading: _addingTracks,
+                          onPressed:
+                              _selectedPlaylistId != null ? _addToExisting : null,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ── Widgets auxiliares ────────────────────────────────────────────────────────
+
+class _ExportButton extends StatelessWidget {
+  final String label;
+  final bool loading;
+  final VoidCallback? onPressed;
+  const _ExportButton(
+      {required this.label, required this.loading, this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onPressed != null && !loading;
+    return GestureDetector(
+      onTap: enabled ? onPressed : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        height: 46,
+        decoration: BoxDecoration(
+          color: enabled ? _green : _green.withOpacity(0.25),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Center(
+          child: loading
+              ? const SizedBox(
+                  width: 18, height: 18,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      valueColor: AlwaysStoppedAnimation(Colors.black)))
+              : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.ios_share,
+                        size: 16,
+                        color: enabled ? Colors.black : Colors.white38),
+                    const SizedBox(width: 8),
+                    Text(label,
+                        style: TextStyle(
+                            color: enabled ? Colors.black : Colors.white38,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 14)),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+}
 
 class _GenerateButton extends StatefulWidget {
   final bool loading;
