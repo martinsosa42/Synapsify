@@ -441,20 +441,41 @@ async def export_playlist(req: ExportRequest, request: Request):
         raise HTTPException(status_code=502, detail="Error al exportar la playlist.")
 
 
-# [NEW] Endpoint para listar playlists del usuario (usado en mode=add)
+# Endpoint para listar playlists del usuario (usado en mode=add)
 @app.get("/playlists")
 async def list_playlists(access_token: str):
     if not access_token:
         raise HTTPException(status_code=401, detail="access_token requerido.")
+    import requests as req_lib
     try:
-        sp = Spotify(auth=access_token)
-        results = sp.current_user_playlists(limit=50)
-        playlists = [
-            {"id": p["id"], "name": p["name"], "total": p["tracks"]["total"]}
-            for p in results["items"]
-            if p and p.get("id")
-        ]
+        headers = {"Authorization": f"Bearer {access_token}"}
+        resp = req_lib.get("https://api.spotify.com/v1/me/playlists?limit=50", headers=headers)
+        if resp.status_code != 200:
+            logger.error("Spotify playlists: %s %s", resp.status_code, resp.text)
+            raise HTTPException(status_code=502, detail="Error al obtener las playlists.")
+        data = resp.json()
+        # Obtener el userId del token para filtrar por owner
+        me_resp = req_lib.get("https://api.spotify.com/v1/me", headers=headers)
+        user_id = me_resp.json().get("id") if me_resp.status_code == 200 else None
+
+        playlists = []
+        for p in data.get("items", []):
+            if not p or not p.get("id"):
+                continue
+            # [FIX] Solo mostrar playlists donde el usuario es dueño o colaborador
+            owner_id = (p.get("owner") or {}).get("id")
+            is_collaborative = p.get("collaborative", False)
+            if owner_id != user_id and not is_collaborative:
+                continue
+            tracks_info = p.get("tracks") or {}
+            playlists.append({
+                "id": p["id"],
+                "name": p["name"],
+                "total": tracks_info.get("total", 0),
+            })
         return {"playlists": playlists}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Error al obtener playlists")
         raise HTTPException(status_code=502, detail="Error al obtener las playlists.")
