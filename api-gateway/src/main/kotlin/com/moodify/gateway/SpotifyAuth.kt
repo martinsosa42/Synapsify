@@ -25,6 +25,7 @@ val SPOTIFY_REDIRECT_URI  = System.getenv("SPOTIFY_REDIRECT_URI")
 val SPOTIFY_SCOPES = listOf(
     "playlist-modify-public",
     "playlist-modify-private",
+    "playlist-read-private",
     "user-read-private",
     "user-read-email",
 ).joinToString(" ")
@@ -62,6 +63,13 @@ data class SpotifyUserProfile(
 @Serializable
 data class AuthResponse(val loginUrl: String)
 
+// [NEW] Respuesta del endpoint /auth/refresh
+@Serializable
+data class RefreshResponse(
+    val accessToken: String,
+    val expiresIn: Int,
+)
+
 fun Route.spotifyAuthRoutes(client: HttpClient) {
 
     get("/auth/login") {
@@ -70,7 +78,8 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             parameters.append("response_type", "code")
             parameters.append("redirect_uri",  SPOTIFY_REDIRECT_URI)
             parameters.append("scope",         SPOTIFY_SCOPES)
-            parameters.append("show_dialog",   "false")
+            parameters.append("show_dialog",   "true")
+            parameters.append("prompt",        "consent")
         }.buildString()
         call.respond(AuthResponse(loginUrl = loginUrl))
     }
@@ -79,7 +88,6 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
         val code = call.request.queryParameters["code"]
             ?: return@get call.respond(HttpStatusCode.BadRequest, "Falta el código")
 
-        // Intercambia code por token usando el cliente con ignoreUnknownKeys
         val tokenResponse = runCatching {
             spotifyClient.post("https://accounts.spotify.com/api/token") {
                 headers {
@@ -100,7 +108,6 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             )
         }
 
-        // Obtiene el perfil del usuario
         val userProfile = runCatching {
             spotifyClient.get("https://api.spotify.com/v1/me") {
                 headers {
@@ -120,10 +127,50 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             spotifyUserId = userProfile.id,
         ))
 
-        // Redirige a Flutter con el token
         call.respondRedirect(
-            "http://localhost:3000/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}"
+            "http://localhost:3000/#/callback?token=${tokenResponse.accessToken}&userId=${userProfile.id}&expiresIn=${tokenResponse.expiresIn}"
         )
+    }
+
+    // [NEW] Refresca el access token usando el refresh token guardado en sesión
+    get("/auth/refresh") {
+        val session = call.sessions.get<UserSession>()
+        val refreshToken = session?.refreshToken
+            ?: return@get call.respond(
+                HttpStatusCode.Unauthorized,
+                mapOf("error" to "No hay sesión activa o falta el refresh token")
+            )
+
+        val tokenResponse = runCatching {
+            spotifyClient.post("https://accounts.spotify.com/api/token") {
+                headers {
+                    val credentials = Base64.getEncoder()
+                        .encodeToString("$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET".toByteArray())
+                    append(HttpHeaders.Authorization, "Basic $credentials")
+                }
+                setBody(FormDataContent(Parameters.build {
+                    append("grant_type",    "refresh_token")
+                    append("refresh_token", refreshToken)
+                }))
+            }.body<SpotifyTokenResponse>()
+        }.getOrElse { e ->
+            return@get call.respond(
+                HttpStatusCode.BadGateway,
+                mapOf("error" to "Error al refrescar token: ${e.message}")
+            )
+        }
+
+        // Actualizar sesión con el nuevo access token
+        // (el refresh token puede rotar o mantenerse igual según Spotify)
+        call.sessions.set(session.copy(
+            accessToken  = tokenResponse.accessToken,
+            refreshToken = tokenResponse.refreshToken ?: session.refreshToken,
+        ))
+
+        call.respond(RefreshResponse(
+            accessToken = tokenResponse.accessToken,
+            expiresIn   = tokenResponse.expiresIn,
+        ))
     }
 
     post("/auth/logout") {

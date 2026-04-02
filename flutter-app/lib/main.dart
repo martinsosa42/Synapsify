@@ -54,10 +54,20 @@ class PlaylistResult {
       );
 }
 
+// [CHANGE] expiresAt para saber cuándo expira el token
 class UserSession {
   final String accessToken;
   final String userId;
-  UserSession({required this.accessToken, required this.userId});
+  final DateTime expiresAt;
+
+  UserSession({
+    required this.accessToken,
+    required this.userId,
+    required this.expiresAt,
+  });
+
+  bool get isExpired =>
+      DateTime.now().isAfter(expiresAt.subtract(const Duration(minutes: 2)));
 }
 
 // [NEW] Modelo para items de playlist del usuario
@@ -79,7 +89,7 @@ Future<PlaylistResult> fetchPlaylist(String prompt) async {
   final response = await http.post(
     Uri.parse('$_gatewayUrl/mood'),
     headers: {'Content-Type': 'application/json'},
-    body: jsonEncode({'mood': prompt, 'limit': 50}),  // [CHANGE] 10 → 50
+    body: jsonEncode({'mood': prompt, 'limit': 50}),
   );
   if (response.statusCode != 200) {
     final body = jsonDecode(response.body);
@@ -93,9 +103,19 @@ Future<String> getLoginUrl() async {
   return jsonDecode(response.body)['loginUrl'];
 }
 
+// [NEW] Refresca el token contra Ktor y devuelve el nuevo accessToken
+Future<String> refreshAccessToken() async {
+  final response = await http.get(Uri.parse('$_gatewayUrl/auth/refresh'));
+  if (response.statusCode != 200) {
+    throw Exception('No se pudo refrescar el token. Iniciá sesión de nuevo.');
+  }
+  final data = jsonDecode(response.body);
+  return data['accessToken'] as String;
+}
+
 // [NEW] Obtener playlists del usuario
-Future<List<SpotifyPlaylist>> fetchUserPlaylists() async {
-  final response = await http.get(Uri.parse('$_gatewayUrl/playlists'));
+Future<List<SpotifyPlaylist>> fetchUserPlaylists(String accessToken) async {
+  final response = await http.get(Uri.parse('$_gatewayUrl/playlists?access_token=$accessToken'));
   if (response.statusCode != 200) {
     final body = jsonDecode(response.body);
     throw Exception(body['error'] ?? 'Error al obtener playlists');
@@ -108,6 +128,7 @@ Future<List<SpotifyPlaylist>> fetchUserPlaylists() async {
 
 // [NEW] Exportar tracks a Spotify
 Future<Map<String, dynamic>> exportToSpotify({
+  required String accessToken,
   required List<String> trackIds,
   required String mode,
   String? playlistName,
@@ -118,6 +139,7 @@ Future<Map<String, dynamic>> exportToSpotify({
     Uri.parse('$_gatewayUrl/export'),
     headers: {'Content-Type': 'application/json'},
     body: jsonEncode({
+      'accessToken': accessToken,
       'trackIds': trackIds,
       'mode': mode,
       if (playlistName != null) 'playlistName': playlistName,
@@ -162,12 +184,15 @@ class SynapsifyApp extends StatelessWidget {
       onGenerateRoute: (settings) {
         if (settings.name != null && settings.name!.startsWith('/callback')) {
           final uri = Uri.parse(settings.name!);
-          final token  = uri.queryParameters['token'];
-          final userId = uri.queryParameters['userId'];
+          final token     = uri.queryParameters['token'];
+          final userId    = uri.queryParameters['userId'];
+          // [CHANGE] leer expiresIn del callback para calcular expiresAt
+          final expiresIn = int.tryParse(uri.queryParameters['expiresIn'] ?? '') ?? 3600;
           return MaterialPageRoute(
             builder: (_) => SynapsifyScreen(
-              initialToken:  token,
-              initialUserId: userId,
+              initialToken:     token,
+              initialUserId:    userId,
+              initialExpiresIn: expiresIn,
             ),
           );
         }
@@ -180,7 +205,13 @@ class SynapsifyApp extends StatelessWidget {
 class SynapsifyScreen extends StatefulWidget {
   final String? initialToken;
   final String? initialUserId;
-  const SynapsifyScreen({super.key, this.initialToken, this.initialUserId});
+  final int initialExpiresIn;
+  const SynapsifyScreen({
+    super.key,
+    this.initialToken,
+    this.initialUserId,
+    this.initialExpiresIn = 3600,
+  });
   @override
   State<SynapsifyScreen> createState() => _SynapsifyScreenState();
 }
@@ -197,6 +228,11 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
   @override
   void initState() {
     super.initState();
+    // DEBUG TEMPORAL
+    if (widget.initialToken != null) {
+      print('DEBUG TOKEN: ${widget.initialToken}');
+      html.window.console.log('DEBUG TOKEN: ${widget.initialToken}');
+    }
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
@@ -210,14 +246,46 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
   void _checkCallbackFromUrl() {
     final href = html.window.location.href;
     final uri = Uri.parse(href);
-    final token  = widget.initialToken  ?? uri.queryParameters['token'];
-    final userId = widget.initialUserId ?? uri.queryParameters['userId'];
+    final token     = widget.initialToken  ?? uri.queryParameters['token'];
+    final userId    = widget.initialUserId ?? uri.queryParameters['userId'];
+    final expiresIn = widget.initialExpiresIn != 3600
+        ? widget.initialExpiresIn
+        : int.tryParse(uri.queryParameters['expiresIn'] ?? '') ?? 3600;
+
+    // DEBUG TEMPORAL
+    if (token != null) {
+      print("DEBUG TOKEN: $token");
+      html.window.console.log("DEBUG TOKEN: $token");
+    }
+
     if (token != null && userId != null && _session == null) {
       setState(() {
-        _session = UserSession(accessToken: token, userId: userId);
+        _session = UserSession(
+          accessToken: token,
+          userId: userId,
+          // [CHANGE] guardar cuándo expira el token
+          expiresAt: DateTime.now().add(Duration(seconds: expiresIn)),
+        );
       });
       html.window.history.replaceState(null, '', '/');
     }
+  }
+
+  // [NEW] Devuelve un token válido, refrescando si está por vencer
+  Future<String> _getValidToken() async {
+    if (_session == null) throw Exception('No hay sesión activa.');
+    if (!_session!.isExpired) return _session!.accessToken;
+
+    // Token expirado o a punto de expirar — refrescar
+    final newToken = await refreshAccessToken();
+    setState(() {
+      _session = UserSession(
+        accessToken: newToken,
+        userId: _session!.userId,
+        expiresAt: DateTime.now().add(const Duration(seconds: 3600)),
+      );
+    });
+    return newToken;
   }
 
   @override
@@ -254,7 +322,7 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
     http.post(Uri.parse('$_gatewayUrl/auth/logout'));
   }
 
-  // [NEW] Abre el bottom sheet de exportación
+  // [CHANGE] _showExportSheet ahora pasa _getValidToken al sheet
   void _showExportSheet() {
     if (_result == null) return;
     showModalBottomSheet(
@@ -264,6 +332,7 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
       builder: (_) => _ExportSheet(
         tracks: _result!.tracks,
         moodText: _controller.text.trim(),
+        getValidToken: _getValidToken,
       ),
     );
   }
@@ -518,7 +587,7 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
                               ),
                               const Spacer(),
 
-                              // [NEW] Botón exportar (solo si hay sesión activa)
+                              // Botón exportar (solo si hay sesión activa)
                               if (_session != null)
                                 GestureDetector(
                                   onTap: _showExportSheet,
@@ -651,7 +720,13 @@ class _SynapsifyScreenState extends State<SynapsifyScreen>
 class _ExportSheet extends StatefulWidget {
   final List<Track> tracks;
   final String moodText;
-  const _ExportSheet({required this.tracks, required this.moodText});
+  // [CHANGE] en vez de recibir el token fijo, recibe una función que siempre devuelve un token válido
+  final Future<String> Function() getValidToken;
+  const _ExportSheet({
+    required this.tracks,
+    required this.moodText,
+    required this.getValidToken,
+  });
 
   @override
   State<_ExportSheet> createState() => _ExportSheetState();
@@ -694,7 +769,9 @@ class _ExportSheetState extends State<_ExportSheet>
 
   Future<void> _loadPlaylists() async {
     try {
-      final playlists = await fetchUserPlaylists();
+      // [CHANGE] usar token fresco
+      final token = await widget.getValidToken();
+      final playlists = await fetchUserPlaylists(token);
       setState(() { _userPlaylists = playlists; _loadingPlaylists = false; });
     } catch (e) {
       setState(() { _loadError = e.toString(); _loadingPlaylists = false; });
@@ -706,7 +783,10 @@ class _ExportSheetState extends State<_ExportSheet>
     if (name.isEmpty) return;
     setState(() { _creatingPlaylist = true; _createError = null; });
     try {
+      // [CHANGE] usar token fresco
+      final token = await widget.getValidToken();
       final result = await exportToSpotify(
+        accessToken: token,
         trackIds: widget.tracks.map((t) => t.id).toList(),
         mode: 'create',
         playlistName: name,
@@ -724,7 +804,10 @@ class _ExportSheetState extends State<_ExportSheet>
     if (_selectedPlaylistId == null) return;
     setState(() { _addingTracks = true; _addError = null; });
     try {
+      // [CHANGE] usar token fresco
+      final token = await widget.getValidToken();
       final result = await exportToSpotify(
+        accessToken: token,
         trackIds: widget.tracks.map((t) => t.id).toList(),
         mode: 'add',
         targetPlaylistId: _selectedPlaylistId,

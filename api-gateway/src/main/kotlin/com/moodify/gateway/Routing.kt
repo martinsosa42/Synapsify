@@ -15,12 +15,12 @@ import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import kotlinx.serialization.Serializable
 
-// ── Schemas ───────────────────────────────────────────────────────────────────
+// -- Schemas ------------------------------------------------------------------
 
 @Serializable
 data class MoodRequest(
     val mood: String,
-    val limit: Int = 50,  // [CHANGE] default 10 → 50
+    val limit: Int = 50,
 )
 
 @Serializable
@@ -58,10 +58,11 @@ data class ErrorResponse(val error: String)
 @Serializable
 data class ExportRequest(
     val trackIds: List<String>,
-    val mode: String,                   // "create" | "add"
+    val mode: String,                    // "create" | "add"
     val playlistName: String? = null,
     val targetPlaylistId: String? = null,
     val moodText: String? = null,
+    val accessToken: String? = null,     // [FIX] fallback cuando no hay cookie de sesion
 )
 
 @Serializable
@@ -94,7 +95,7 @@ data class PlaylistsResponse(
     val playlists: List<PlaylistItem>,
 )
 
-// ── HTTP Client ───────────────────────────────────────────────────────────────
+// -- HTTP Client --------------------------------------------------------------
 
 val httpClient = HttpClient(CIO) {
     install(ContentNegotiation) { json() }
@@ -102,7 +103,7 @@ val httpClient = HttpClient(CIO) {
 
 val logicEngineUrl = System.getenv("LOGIC_ENGINE_URL") ?: "http://localhost:8000"
 
-// ── Routing ───────────────────────────────────────────────────────────────────
+// -- Routing ------------------------------------------------------------------
 
 fun Application.configureRouting() {
     routing {
@@ -111,21 +112,21 @@ fun Application.configureRouting() {
             call.respond(mapOf("status" to "ok", "service" to "synapsify-api-gateway"))
         }
 
-        // Rutas de autenticación OAuth2
+        // Rutas de autenticacion OAuth2
         spotifyAuthRoutes(httpClient)
 
-        // POST /mood — genera playlist (con o sin autenticación)
+        // POST /mood -- genera playlist (con o sin autenticacion)
         post("/mood") {
             val request = runCatching { call.receive<MoodRequest>() }.getOrNull()
                 ?: return@post call.respond(
                     HttpStatusCode.BadRequest,
-                    ErrorResponse("Cuerpo de petición inválido"),
+                    ErrorResponse("Cuerpo de peticion invalido"),
                 )
 
             if (request.mood.isBlank()) {
                 return@post call.respond(
                     HttpStatusCode.UnprocessableEntity,
-                    ErrorResponse("El campo 'mood' no puede estar vacío"),
+                    ErrorResponse("El campo 'mood' no puede estar vacio"),
                 )
             }
 
@@ -143,7 +144,7 @@ fun Application.configureRouting() {
                 }
                 if (!response.status.isSuccess()) {
                     val errorBody = response.bodyAsText()
-                    throw Exception("Logic Engine respondió ${response.status.value}: $errorBody")
+                    throw Exception("Logic Engine respondio ${response.status.value}: $errorBody")
                 }
                 response.body<LogicEngineResponse>()
             }.getOrElse { e ->
@@ -156,24 +157,27 @@ fun Application.configureRouting() {
             call.respond(HttpStatusCode.OK, engineResponse)
         }
 
-        // [NEW] POST /export — exporta tracks a una playlist de Spotify
+        // [NEW] POST /export -- exporta tracks a una playlist de Spotify
         post("/export") {
             val session = call.sessions.get<UserSession>()
-                ?: return@post call.respond(
-                    HttpStatusCode.Unauthorized,
-                    ErrorResponse("Debés iniciar sesión con Spotify para exportar."),
-                )
 
             val request = runCatching { call.receive<ExportRequest>() }.getOrNull()
                 ?: return@post call.respond(
                     HttpStatusCode.BadRequest,
-                    ErrorResponse("Cuerpo de petición inválido"),
+                    ErrorResponse("Cuerpo de peticion invalido"),
+                )
+
+            // [FIX] Token desde cookie de sesion o desde el body (Flutter no maneja cookies)
+            val accessToken = session?.accessToken ?: request.accessToken
+                ?: return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    ErrorResponse("Debes iniciar sesion con Spotify para exportar."),
                 )
 
             if (request.trackIds.isEmpty()) {
                 return@post call.respond(
                     HttpStatusCode.UnprocessableEntity,
-                    ErrorResponse("La lista de tracks no puede estar vacía"),
+                    ErrorResponse("La lista de tracks no puede estar vacia"),
                 )
             }
 
@@ -188,7 +192,7 @@ fun Application.configureRouting() {
                 val response = httpClient.post("$logicEngineUrl/export") {
                     contentType(ContentType.Application.Json)
                     setBody(LogicEngineExportRequest(
-                        accessToken      = session.accessToken,
+                        accessToken      = accessToken,
                         trackIds         = request.trackIds,
                         mode             = request.mode,
                         playlistName     = request.playlistName,
@@ -198,7 +202,7 @@ fun Application.configureRouting() {
                 }
                 if (!response.status.isSuccess()) {
                     val errorBody = response.bodyAsText()
-                    throw Exception("Logic Engine respondió ${response.status.value}: $errorBody")
+                    throw Exception("Logic Engine respondio ${response.status.value}: $errorBody")
                 }
                 response.body<ExportResponse>()
             }.getOrElse { e ->
@@ -211,21 +215,24 @@ fun Application.configureRouting() {
             call.respond(HttpStatusCode.OK, exportResponse)
         }
 
-        // [NEW] GET /playlists — lista las playlists del usuario autenticado
+        // [NEW] GET /playlists -- lista las playlists del usuario autenticado
         get("/playlists") {
             val session = call.sessions.get<UserSession>()
+            // [FIX] Flutter manda el token como query param; cookie como fallback
+            val accessToken = session?.accessToken
+                ?: call.request.queryParameters["access_token"]
                 ?: return@get call.respond(
                     HttpStatusCode.Unauthorized,
-                    ErrorResponse("Debés iniciar sesión con Spotify."),
+                    ErrorResponse("Debes iniciar sesion con Spotify."),
                 )
 
             val playlistsResponse = runCatching {
                 val response = httpClient.get("$logicEngineUrl/playlists") {
-                    parameter("access_token", session.accessToken)
+                    parameter("access_token", accessToken)
                 }
                 if (!response.status.isSuccess()) {
                     val errorBody = response.bodyAsText()
-                    throw Exception("Logic Engine respondió ${response.status.value}: $errorBody")
+                    throw Exception("Logic Engine respondio ${response.status.value}: $errorBody")
                 }
                 response.body<PlaylistsResponse>()
             }.getOrElse { e ->

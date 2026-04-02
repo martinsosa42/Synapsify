@@ -277,17 +277,34 @@ def search_tracks(sp: Spotify, params: dict, limit: int) -> list[TrackOut]:
     return [t for _, t in scored_tracks]
 
 
-def save_playlist(sp: Spotify, text: str,
+def save_playlist(access_token: str, text: str,
                   track_ids: list[str], interpretation: str) -> tuple[str, str]:
-    user_id = sp.me()["id"]
-    playlist = sp.user_playlist_create(
-        user=user_id,
-        name=f"Synapsify: {text[:40]}",
-        public=False,
-        description=f"Generada por Synapsify · {interpretation}",
+    import requests as req_lib
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    # [FIX] POST /me/playlists en vez del deprecado /users/{id}/playlists
+    resp = req_lib.post(
+        "https://api.spotify.com/v1/me/playlists",
+        headers=headers,
+        json={
+            "name": f"Synapsify: {text[:40]}",
+            "public": False,
+            "description": f"Generada por Synapsify · {interpretation}",
+        },
     )
-    sp.playlist_add_items(playlist["id"], [f"spotify:track:{tid}" for tid in track_ids])
-    return playlist["id"], playlist["external_urls"]["spotify"]
+    resp.raise_for_status()
+    playlist = resp.json()
+    playlist_id = playlist["id"]
+    uris = [f"spotify:track:{tid}" for tid in track_ids]
+    for i in range(0, len(uris), 100):
+        req_lib.post(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers=headers,
+            json={"uris": uris[i:i+100]},
+        )
+    return playlist_id, playlist["external_urls"]["spotify"]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -326,7 +343,7 @@ async def analyze_mood(req: MoodRequest, request: Request):
     if sp_user:
         try:
             playlist_id, playlist_url = save_playlist(
-                sp=sp_user,
+                access_token=req.accessToken,
                 text=req.text,
                 track_ids=[t.id for t in tracks],
                 interpretation=interpretation,
@@ -347,24 +364,46 @@ async def analyze_mood(req: MoodRequest, request: Request):
 @app.post("/export", response_model=ExportResponse)
 @limiter.limit("10/minute")
 async def export_playlist(req: ExportRequest, request: Request):
-    sp = Spotify(auth=req.accessToken)
+    import requests as req_lib
+
+    headers = {
+        "Authorization": f"Bearer {req.accessToken}",
+        "Content-Type": "application/json",
+    }
     uris = [f"spotify:track:{tid}" for tid in req.trackIds]
 
     try:
         if req.mode == "create":
-            # Crear playlist nueva
             name = req.playlistName or f"Synapsify · {req.moodText or 'Mix'}"[:100]
-            user_id = sp.me()["id"]
-            playlist = sp.user_playlist_create(
-                user=user_id,
-                name=name,
-                public=False,
-                description="Exportada desde Synapsify",
+
+            # [FIX] Usar POST /me/playlists en vez del deprecado /users/{id}/playlists
+            resp = req_lib.post(
+                "https://api.spotify.com/v1/me/playlists",
+                headers=headers,
+                json={"name": name, "public": False, "description": "Exportada desde Synapsify"},
             )
-            sp.playlist_add_items(playlist["id"], uris)
+            if resp.status_code not in (200, 201):
+                logger.error("Spotify create playlist: %s %s", resp.status_code, resp.text)
+                raise HTTPException(status_code=502, detail=f"Spotify error {resp.status_code}: {resp.text}")
+
+            playlist = resp.json()
+            playlist_id = playlist["id"]
+            playlist_url = playlist["external_urls"]["spotify"]
+
+            # Agregar tracks en batches de 100 (límite de Spotify)
+            for i in range(0, len(uris), 100):
+                batch = uris[i:i+100]
+                add_resp = req_lib.post(
+                    f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+                    headers=headers,
+                    json={"uris": batch},
+                )
+                if add_resp.status_code not in (200, 201):
+                    logger.error("Spotify add tracks: %s %s", add_resp.status_code, add_resp.text)
+
             return ExportResponse(
-                playlistId=playlist["id"],
-                playlistUrl=playlist["external_urls"]["spotify"],
+                playlistId=playlist_id,
+                playlistUrl=playlist_url,
                 tracksAdded=len(uris),
             )
 
@@ -372,9 +411,23 @@ async def export_playlist(req: ExportRequest, request: Request):
             if not req.targetPlaylistId:
                 raise HTTPException(status_code=422,
                                     detail="targetPlaylistId requerido para mode=add")
-            sp.playlist_add_items(req.targetPlaylistId, uris)
-            playlist = sp.playlist(req.targetPlaylistId,
-                                   fields="id,external_urls")
+
+            for i in range(0, len(uris), 100):
+                batch = uris[i:i+100]
+                add_resp = req_lib.post(
+                    f"https://api.spotify.com/v1/playlists/{req.targetPlaylistId}/tracks",
+                    headers=headers,
+                    json={"uris": batch},
+                )
+                if add_resp.status_code not in (200, 201):
+                    logger.error("Spotify add tracks: %s %s", add_resp.status_code, add_resp.text)
+
+            # Obtener URL de la playlist
+            pl_resp = req_lib.get(
+                f"https://api.spotify.com/v1/playlists/{req.targetPlaylistId}?fields=id,external_urls",
+                headers=headers,
+            )
+            playlist = pl_resp.json()
             return ExportResponse(
                 playlistId=playlist["id"],
                 playlistUrl=playlist["external_urls"]["spotify"],
