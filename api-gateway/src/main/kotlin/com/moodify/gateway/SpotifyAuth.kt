@@ -79,7 +79,6 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
             parameters.append("redirect_uri",  SPOTIFY_REDIRECT_URI)
             parameters.append("scope",         SPOTIFY_SCOPES)
             parameters.append("show_dialog",   "true")
-            parameters.append("prompt",        "consent")
         }.buildString()
         call.respond(AuthResponse(loginUrl = loginUrl))
     }
@@ -120,6 +119,10 @@ fun Route.spotifyAuthRoutes(client: HttpClient) {
                 mapOf("error" to "Profile error: ${e.message}")
             )
         }
+
+        // DEBUG — loguear scopes otorgados por Spotify
+        println("[DEBUG] Scopes otorgados: ${tokenResponse.scope}")
+        println("[DEBUG] Refresh token presente: ${tokenResponse.refreshToken != null}")
 
         call.sessions.set(UserSession(
             accessToken   = tokenResponse.accessToken,

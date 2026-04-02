@@ -290,7 +290,7 @@ def save_playlist(access_token: str, text: str,
         headers=headers,
         json={
             "name": f"Synapsify: {text[:40]}",
-            "public": False,
+            "public": True,
             "description": f"Generada por Synapsify · {interpretation}",
         },
     )
@@ -300,7 +300,7 @@ def save_playlist(access_token: str, text: str,
     uris = [f"spotify:track:{tid}" for tid in track_ids]
     for i in range(0, len(uris), 100):
         req_lib.post(
-            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
             headers=headers,
             json={"uris": uris[i:i+100]},
         )
@@ -380,7 +380,7 @@ async def export_playlist(req: ExportRequest, request: Request):
             resp = req_lib.post(
                 "https://api.spotify.com/v1/me/playlists",
                 headers=headers,
-                json={"name": name, "public": False, "description": "Exportada desde Synapsify"},
+                json={"name": name, "public": True, "description": "Exportada desde Synapsify"},
             )
             if resp.status_code not in (200, 201):
                 logger.error("Spotify create playlist: %s %s", resp.status_code, resp.text)
@@ -394,7 +394,7 @@ async def export_playlist(req: ExportRequest, request: Request):
             for i in range(0, len(uris), 100):
                 batch = uris[i:i+100]
                 add_resp = req_lib.post(
-                    f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+                    f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
                     headers=headers,
                     json={"uris": batch},
                 )
@@ -415,7 +415,7 @@ async def export_playlist(req: ExportRequest, request: Request):
             for i in range(0, len(uris), 100):
                 batch = uris[i:i+100]
                 add_resp = req_lib.post(
-                    f"https://api.spotify.com/v1/playlists/{req.targetPlaylistId}/tracks",
+                    f"https://api.spotify.com/v1/playlists/{req.targetPlaylistId}/items",
                     headers=headers,
                     json={"uris": batch},
                 )
